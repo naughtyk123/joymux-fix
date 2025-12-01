@@ -27,40 +27,83 @@ PROP_ORDER = ["RY", "RX", "LY", "LX"]
 # 允许的分隔符
 SEP_RE = re.compile(r'[,\s，、;；/／\|]+')
 
-
 def run(cmd, inp=None):
     r = subprocess.run(cmd, input=inp, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode != 0:
         raise RuntimeError(f"cmd failed: {' '.join(cmd)}\n{r.stderr.decode()}")
     return r.stdout
 
-
 def find_node_block(dts_text, node_path):
-    """Return (brace_open_idx, brace_close_idx, inner_text) for the node block."""
+    """Return (brace_open_idx, brace_close_idx, inner_text) for the node block.
+
+    Improved search:
+      - supports optional labels (label:node@addr { ... })
+      - matches needle in either label or node-name
+      - fallback: find node that has a compatible property containing the needle
+      - on failure: list detected node labels/names to aid debugging
+    """
     needle = node_path.strip("/").split("/")[-1] if node_path.startswith("/") else node_path
-    m = None
-    for m0 in re.finditer(r'^[ \t]*([A-Za-z0-9_,\-@.]+)\s*\{', dts_text, re.M):
-        if needle in m0.group(1):
-            m = m0; break
-    if not m:
-        raise RuntimeError(f"找不到节点名包含 “{needle}” 的块，请检查 node_path")
-    brace_open = dts_text.find("{", m.end()-1)
+
+    # Pattern captures optional label and node-name (node@addr etc.)
+    node_pat = re.compile(r'^[ \t]*(?:([A-Za-z0-9_]+):\s*)?([A-Za-z0-9_,\-@.]+)\s*\{', re.M)
+
+    m_found = None
+    # First pass: match label or node name containing needle
+    for m in node_pat.finditer(dts_text):
+        label = m.group(1) or ""
+        node_name = m.group(2) or ""
+        if needle in node_name or (label and needle in label):
+            m_found = m
+            break
+
+    # Fallback 1: search for compatible property that contains the needle
+    if not m_found:
+        comp_pat = re.compile(r'^\s*compatible\s*=\s*([^;]+);', re.M | re.I)
+        for comp_m in comp_pat.finditer(dts_text):
+            if needle in comp_m.group(1):
+                # find the nearest preceding node start before this compatible property
+                candidate = None
+                for n in node_pat.finditer(dts_text, 0, comp_m.start()):
+                    candidate = n
+                if candidate:
+                    m_found = candidate
+                    break
+
+    if not m_found:
+        # collect some discovered nodes (label:name) to help debugging
+        found = []
+        for m0 in node_pat.finditer(dts_text):
+            label = m0.group(1) or ""
+            node_name = m0.group(2) or ""
+            found.append(f"{label + ':' if label else ''}{node_name}")
+            if len(found) >= 200:
+                break
+        sample = "\n".join(found[:200])
+        raise RuntimeError(
+            f"找不到节点名包含 “{needle}” 的块，请检查 node_path.\n"
+            f"请在 DT 源中检查节点名或提供正确的 --node_path（例如 '/soc/joypad@123'）。\n"
+            f"已在 DTS 中检测到的节点（最多 200 个）：\n{sample}"
+        )
+
+    # find opening brace position and match closing brace
+    brace_open = dts_text.find("{", m_found.end() - 1)
     if brace_open < 0:
         raise RuntimeError("语法错误：未找到左大括号")
     i, depth = brace_open + 1, 1
     while i < len(dts_text):
         c = dts_text[i]
-        if c == "{": depth += 1
+        if c == "{":
+            depth += 1
         elif c == "}":
             depth -= 1
             if depth == 0:
-                end_idx = i; break
+                end_idx = i
+                break
         i += 1
     else:
         raise RuntimeError("语法错误：未找到匹配的右大括号")
     inner_start = brace_open + 1
     return brace_open, end_idx, dts_text[inner_start:end_idx]
-
 
 def upsert_prop(block_text, prop_name, value_line):
     """
@@ -89,17 +132,14 @@ def upsert_prop(block_text, prop_name, value_line):
         lines.insert(insert_at, new_line)
     return "\n".join(lines)
 
-
 def remove_prop(block_text, prop_name):
     lines = block_text.splitlines()
     pat_assign = re.compile(r'^\s*' + re.escape(prop_name) + r'\s*=')
     pat_bool   = re.compile(r'^\s*' + re.escape(prop_name) + r'\s*;')
     return "\n".join([l for l in lines if not (pat_assign.match(l) or pat_bool.match(l))])
 
-
 def _split_tokens(s: str):
     return [t for t in SEP_RE.split(s or "") if t]
-
 
 def parse_user_amux(s):
     """
@@ -115,7 +155,6 @@ def parse_user_amux(s):
     if set(arr) != set(USER_ORDER) or len(arr) != 4:
         raise ValueError(f"amux_map 必须是 4 项且为 {USER_ORDER} 的一个排列；解析到: {arr}")
     return arr
-
 
 def parse_invert_tokens(s):
     """
@@ -138,7 +177,6 @@ def parse_invert_tokens(s):
         out.append(alias[p])
     return out
 
-
 def parse_tuning(s):
     s = (s or "200").replace(" ", "")
     if s.isdigit(): return [s]*8
@@ -147,18 +185,15 @@ def parse_tuning(s):
         raise ValueError("tuning 需为单个整数或 8 个逗号分隔整数（x+,x-,y+,y-,rx+,rx-,ry+,ry-）")
     return [p.strip() for p in parts]
 
-
 def dec_to_hex_cell(v):
     v = int(v)
     if v < 0 or v > 0xFFFFFFFF:
         raise ValueError("tuning 超出范围 0..4294967295")
     return f"0x{v:x}"   # 动态宽度十六进制
 
-
 def get_current_invert_flags(block):
     return {k: bool(re.search(rf'^\s*invert-{k}\s*;', block, re.M))
             for k in ["absx","absy","absrx","absry"]}
-
 
 def parse_current_amux_cells(block):
     """
@@ -179,7 +214,6 @@ def parse_current_amux_cells(block):
         raise ValueError("amux-channel-mapping 解析到的数字数量不是 4")
     return cells  # indices 0..3 correspond to PROP_ORDER [RY,RX,LY,LX]
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in_dtb", required=True, help="Path to input .dtb")
@@ -194,7 +228,7 @@ def main():
     ap.add_argument("--invert_csv", default="unchanged",
                     help="Toggle list: 'unchanged' or CSV 'lx,rx' (aliases absx,absy,absrx,absry accepted)")
 
-    # tuning：一个数或八个 CSV
+    # tuning：一个数��八个 CSV
     ap.add_argument("--tuning_str", default="200",
                     help="One integer or 8 CSV: x+,x-,y+,y-,rx+,rx-,ry+,ry-")
 
@@ -245,7 +279,7 @@ def main():
     keys = ["abs_x-p-tuning","abs_x-n-tuning","abs_y-p-tuning","abs_y-n-tuning",
             "abs_rx-p-tuning","abs_rx-n-tuning","abs_ry-p-tuning","abs_ry-n-tuning"]
     for k,v in zip(keys, t):
-        block = upsert_prop(block, k, f"{k} = <{dec_to_hex_cell(v)}>;")
+        block = upsert_prop(block, k, f"{k} = <{dec_to_hex_cell(v)}>;" )
 
     # 6) 组装 & 回编译
     new_dts = dts[:(brace_l+1)] + "\n" + block.strip("\n") + "\n" + dts[brace_r:]
